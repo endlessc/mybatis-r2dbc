@@ -10,6 +10,7 @@ import org.apache.ibatis.reflection.MetaObject;
 import org.apache.ibatis.reflection.factory.ObjectFactory;
 import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.RowBounds;
+import org.apache.ibatis.type.TypeException;
 import org.apache.ibatis.type.TypeHandler;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -28,7 +29,7 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
     private final TypeHandlerRegistry typeHandlerRegistry = new TypeHandlerRegistry();
     private final Configuration configuration;
     private final ObjectFactory objectFactory;
-    private final Mono<Connection> connection;
+    private final ConnectionFactory connectionFactory;
     private final boolean metricsEnabled;
 
     public DefaultReactiveSqlSession(Configuration configuration, ConnectionFactory connectionFactory) {
@@ -37,7 +38,7 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
         //register r2dbc type handlers
         registerTypeHandlers(configuration);
         //noinspection unchecked
-        this.connection = (Mono<Connection>) connectionFactory.create();
+        this.connectionFactory = connectionFactory;
         //metrics enabled
         this.metricsEnabled = Boolean.parseBoolean(configuration.getVariables().getProperty("metrics.enabled", "false"));
     }
@@ -55,13 +56,13 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
     public <T> Mono<T> selectOne(String statementId, Object parameter) {
         MappedStatement mappedStatement = configuration.getMappedStatement(statementId);
         BoundSql boundSql = mappedStatement.getBoundSql(parameter);
-        Mono<T> rowSelected = connection.flatMap(connection -> {
+        Mono<T> rowSelected = getConnection().flatMap(connection -> {
             Statement statement = connection.createStatement(boundSql.getSql());
             if (parameter != null) {
                 fillParams(statement, boundSql, parameter);
             }
             ResultMap resultMap = mappedStatement.getResultMaps().get(0);
-            return Flux.from(statement.execute())
+            return executeFluxStatement(connection, statement)
                     .flatMap(result -> result.map((row, rowMetadata) -> (T) convertRowToResult(row, rowMetadata, resultMap)))
                     .last();
         });
@@ -76,13 +77,13 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
     public <T> Flux<T> select(String statementId, Object parameter) {
         MappedStatement mappedStatement = configuration.getMappedStatement(statementId);
         BoundSql boundSql = mappedStatement.getBoundSql(parameter);
-        Flux<T> rowsSelected = connection.flatMapMany(connection -> {
+        Flux<T> rowsSelected = getConnection().flatMapMany(connection -> {
             Statement statement = connection.createStatement(boundSql.getSql());
             if (parameter != null) {
                 fillParams(statement, boundSql, parameter);
             }
             ResultMap resultMap = mappedStatement.getResultMaps().get(0);
-            return Flux.from(statement.execute())
+            return executeFluxStatement(connection, statement)
                     .flatMap(result -> result.map((row, rowMetadata) -> (T) convertRowToResult(row, rowMetadata, resultMap)));
         });
         if (metricsEnabled) {
@@ -97,10 +98,11 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
         return (Flux<T>) select(statementId, parameter).skip(rowBounds.getOffset()).limitRequest(rowBounds.getLimit());
     }
 
+    @Override
     public Mono<Integer> insert(String statementId, Object parameter) {
         MappedStatement mappedStatement = configuration.getMappedStatement(statementId);
         BoundSql boundSql = mappedStatement.getBoundSql(parameter);
-        Mono<Integer> rowsUpdated = connection.flatMap(connection -> {
+        Mono<Integer> rowsUpdated = getConnection().flatMap(connection -> {
             Statement statement = connection.createStatement(boundSql.getSql());
             final boolean useGeneratedKeys = mappedStatement.getKeyGenerator() != null && mappedStatement.getKeyProperties() != null;
             if (useGeneratedKeys) {
@@ -109,7 +111,7 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
             if (parameter != null) {
                 fillParams(statement, boundSql, parameter);
             }
-            return Mono.from(statement.execute())
+            return executeMonoStatement(connection, statement)
                     .flatMap(result -> {
                         if (!useGeneratedKeys) {
                             return Mono.from(result.getRowsUpdated());
@@ -141,12 +143,12 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
     public Mono<Integer> update(String statementId, Object parameter) {
         MappedStatement mappedStatement = configuration.getMappedStatement(statementId);
         BoundSql boundSql = mappedStatement.getBoundSql(parameter);
-        Mono<Integer> updatedRows = connection.flatMap(connection -> {
+        Mono<Integer> updatedRows = getConnection().flatMap(connection -> {
             Statement statement = connection.createStatement(boundSql.getSql());
             if (parameter != null) {
                 fillParams(statement, boundSql, parameter);
             }
-            return Mono.from(statement.execute())
+            return executeMonoStatement(connection, statement)
                     .flatMap(result -> Mono.from(result.getRowsUpdated()));
         });
         if (metricsEnabled) {
@@ -170,24 +172,41 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
 
     public void fillParams(Statement statement, BoundSql boundSql, Object parameter) {
         List<ParameterMapping> parameterMappings = boundSql.getParameterMappings();
-        MetaObject metaObject = configuration.newMetaObject(parameter);
-        for (int i = 0; i < parameterMappings.size(); i++) {
-            ParameterMapping parameterMapping = parameterMappings.get(i);
-            Object paramValue = metaObject.getValue(parameterMapping.getProperty());
-            Class<?> parameterClass = parameter.getClass();
-            TypeHandler<?> typeHandler = parameterMapping.getTypeHandler();
-            if (typeHandler instanceof R2DBCTypeHandler) {
-                ((R2DBCTypeHandler<Object>) typeHandler).setParameter(statement, i, paramValue, parameterMapping.getJdbcType());
-            } else if (typeHandlerRegistry.hasTypeHandler(parameterClass)) {
-                typeHandlerRegistry.getTypeHandler(parameterClass).setParameter(statement, i, paramValue, parameterMapping.getJdbcType());
-            } else {
-                if (paramValue != null) {
-                    statement.bind(i, paramValue);
-                } else {
-                    statement.bindNull(i, parameterMapping.getJavaType());
+        if (parameterMappings != null) {
+            for (int i = 0; i < parameterMappings.size(); i++) {
+                ParameterMapping parameterMapping = parameterMappings.get(i);
+                if (parameterMapping.getMode() != ParameterMode.OUT) {
+                    Object value;
+                    String propertyName = parameterMapping.getProperty();
+                    if (boundSql.hasAdditionalParameter(propertyName)) {
+                        value = boundSql.getAdditionalParameter(propertyName);
+                    } else if (parameter == null) {
+                        value = null;
+                    } else if (typeHandlerRegistry.hasTypeHandler(parameter.getClass())) {
+                        value = parameter;
+                    } else {
+                        MetaObject metaObject = configuration.newMetaObject(parameter);
+                        value = metaObject.getValue(propertyName);
+                    }
+                    if (value == null) {
+                        statement.bindNull(i, parameterMapping.getJavaType());
+                        return;
+                    }
+                    TypeHandler typeHandler = parameterMapping.getTypeHandler();
+                    try {
+                        Class<?> parameterClass = value.getClass();
+                        if (typeHandler instanceof R2DBCTypeHandler) {
+                            ((R2DBCTypeHandler<Object>) typeHandler).setParameter(statement, i, value, parameterMapping.getJdbcType());
+                        } else if (typeHandlerRegistry.hasTypeHandler(parameterClass)) {
+                            typeHandlerRegistry.getTypeHandler(parameterClass).setParameter(statement, i, value, parameterMapping.getJdbcType());
+                        } else {
+                            statement.bind(i, value);
+                        }
+                    } catch (TypeException e) {
+                        throw new TypeException("Could not set parameters for mapping: " + parameterMapping + ". Cause: " + e, e);
+                    }
                 }
             }
-
         }
     }
 
@@ -197,7 +216,9 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
         boolean pojoMapping = !resultMap.getResultMappings().isEmpty();
         if (NUMBER_TYPES.contains(type)) {
             Number columnValue = (Number) row.get(0);
-            if (columnValue == null) return null;
+            if (columnValue == null) {
+                return null;
+            }
             if (type.equals(columnValue.getClass())) {
                 return columnValue;
             } else if (type.equals(Byte.class) || type.equals(byte.class)) {
@@ -258,6 +279,19 @@ public class DefaultReactiveSqlSession implements ReactiveSqlSession {
         } else {
             return row.get(0, type);
         }
+    }
+
+    private Flux<? extends Result> executeFluxStatement(Connection connection, Statement statement) {
+        return Flux.from(statement.execute())
+                .doFinally(a -> ((Mono) connection.close()).subscribe());
+    }
+    private Mono<? extends Result> executeMonoStatement(Connection connection, Statement statement) {
+        return Mono.from(statement.execute())
+                .doFinally(a -> ((Mono) connection.close()).subscribe());
+    }
+    private Mono<Connection> getConnection() {
+        Mono<Connection> connection = (Mono<Connection>) connectionFactory.create();
+        return connection;
     }
 
 }
